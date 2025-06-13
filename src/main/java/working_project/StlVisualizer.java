@@ -3,93 +3,64 @@ package working_project;
 import working_project.core.Camera;
 import working_project.core.WindowManager;
 import working_project.gui.ImGuiManager;
-import working_project.io.FileDialogHandler;
-import working_project.io.InputHandler;
-import working_project.model.ModelLoader;
-import working_project.model.ModelManager;
-import working_project.rendering.Point3D;
-import working_project.rendering.Renderer;
+import working_project.input.FileDialogHandler;
+import working_project.input.InputHandler;
+import working_project.model.io.ModelIOService;
+import working_project.rendering.RenderService;
+import working_project.service.SceneService;
 import org.joml.Vector3f;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import static org.lwjgl.opengl.GL11.*;
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+/**
+ * Главный класс приложения. Инициализирует все сервисы и запускает основной цикл.
+ */
 public class StlVisualizer {
-
-    private static final ExecutorService executorService = Executors.newFixedThreadPool(
-            Math.max(2, Runtime.getRuntime().availableProcessors() - 1)
-    );
-
-    public static void main(String[] args) {
-        System.out.println("Starting StlVisualizer...");
+    public static void main(String[] args) throws IOException {
+        // 1) Инициализация окна
         WindowManager window = new WindowManager(1920, 1080, "3D Editor");
-        System.out.println("WindowManager initialized");
 
+        // 2) Инициализация GUI (ImGui)
         ImGuiManager imgui = new ImGuiManager(window);
-        System.out.println("ImGuiManager initialized");
-        Camera camera = new Camera(new Vector3f(5, 0, 0));
-        System.out.println("Camera initialized");
-        Renderer renderer = new Renderer();
-        System.out.println("Renderer initialized");
-        ModelLoader loader = new ModelLoader();
-        System.out.println("ModelLoader initialized");
 
-        ModelManager modelManager = new ModelManager(loader, camera, renderer);
-        boolean[] onlyPointsMode = {false};
+        // 3) Инициализация камеры
+        Camera camera = new Camera(new Vector3f(0, 0, 5));
 
-        // лассо: Добавляем флаг lassoMode
-        boolean[] lassoMode = {false};
-        // лассо: Передаём lassoMode в InputHandler
-        InputHandler inputHandler = new InputHandler(window, camera, modelManager, lassoMode);
-        FileDialogHandler dialogHandler = new FileDialogHandler();
+        // 4) Сервис рендеринга
+        RenderService renderService = new RenderService(window, camera);
 
-        List<ModelLoader.Chunk> chunks = new ArrayList<>();
-        List<Point3D> points = new ArrayList<>();
-        boolean[] isModelLoaded = {false};
-        boolean[] isPointCloud = {false};
-        boolean[] isRendering = {false};
+        // 5) Сервис ввода файлов и сцена
+        FileDialogHandler fileDialog = new FileDialogHandler();
+        ModelIOService ioService = new ModelIOService();
+        SceneService sceneService = new SceneService(ioService, renderService);
 
-        System.out.println("Starting main loop...");
+        // 6) Обработчик ввода (камера, модель, ласссо)
+        AtomicBoolean lassoMode = new AtomicBoolean(false);
+        InputHandler inputHandler = new InputHandler(window, camera, sceneService, lassoMode);
+
+        // 7) Основной цикл приложения
         while (!window.shouldClose()) {
+            // Обработка событий
             window.pollEvents();
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-            glClearColor(0.15f, 0.15f, 0.15f, 1.0f); // Тёмный фон для сцены
 
+            // Начало кадра ImGui
             imgui.newFrame();
-            imgui.renderUI(modelManager, dialogHandler, chunks, points, isModelLoaded, isPointCloud, isRendering, onlyPointsMode);
 
-            if (isRendering[0] && isModelLoaded[0]) {
-                if (isPointCloud[0]) {
-                    renderer.renderPoints(window, camera, points, modelManager.getModelYaw(), modelManager.getModelPitch());
-                } else {
-                    renderer.render(window, camera, chunks, modelManager.getModelYaw(), modelManager.getModelPitch());
-                }
-            }
+            // Отрисовка UI панели
+            imgui.renderUI(sceneService, fileDialog, lassoMode.get());
+
+            // Отрисовка сцены (модель или облако точек)
+            sceneService.renderFrame();
+
+            // Отрисовка UI и swapBuffers
             imgui.renderDrawData();
             window.swapBuffers();
         }
 
-        System.out.println("Cleaning up...");
-        for (ModelLoader.Chunk chunk : chunks) {
-            chunk.cleanup();
-        }
-        modelManager.cleanup();
-        renderer.cleanup();
+        // 8) Очистка ресурсов
+        sceneService.cleanup();    // включает очистку рендера и чанков
         imgui.cleanup();
         window.cleanup();
-
-        executorService.shutdown();
-        try {
-            if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
-                executorService.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            executorService.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
     }
 }

@@ -1,4 +1,4 @@
-package working_project.rendering;
+package working_project.geometry;
 
 import java.util.Objects;
 
@@ -42,3 +42,4 @@ public class Point3D {
         return Objects.hash(x, y, z);
     }
 }
+

@@ -1,6 +1,6 @@
 package working_project.marching_cubes;
 
-import working_project.rendering.Point3D;
+import working_project.geometry.Point3D;
 
 import java.io.IOException;
 import java.util.ArrayList;

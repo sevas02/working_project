@@ -1,527 +1,240 @@
 package working_project.rendering;
 
-import working_project.model.ModelLoader;
-import org.lwjgl.BufferUtils;
-import org.lwjgl.opengl.*;
-import org.lwjgl.system.MemoryUtil;
+import org.lwjgl.opengl.GL32C;
+import working_project.geometry.Point3D;
 import working_project.core.Camera;
 import working_project.core.ShaderProgram;
 import working_project.core.WindowManager;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
+import org.lwjgl.BufferUtils;
 
 import java.nio.FloatBuffer;
 import java.util.ArrayList;
 import java.util.List;
 
 import static org.lwjgl.opengl.GL11.*;
+import static org.lwjgl.opengl.GL15.*;
+import static org.lwjgl.opengl.GL30.*;
 
+
+/**
+ * Низкоуровневый рендерер: шейдеры, VAO/VBO/EBO, смена режимов и пр.
+ * Рисует сетку, оси и либо список Mesh, либо облако точек.
+ */
 public class Renderer {
-    private int meshVaoId;
-    private int meshVboId;
+    private final WindowManager window;
+    private final Camera camera;
 
-    private int pointsVaoId = 0;
-    private int pointsVboId = 0;
-    private int currentPointsCount = 0;
+    private ShaderProgram modelShader, triangleShader, gridShader;
+    private Mesh gridMesh, axisMesh;
 
-    private ShaderProgram modelShader;
-    private ShaderProgram triangleShader;
-    private ShaderProgram gridShader;
-    private Mesh gridMesh;
-    private Mesh axisMesh;
-    private float objectColorR = 0.3f;
-    private float objectColorG = 0.3f;
-    private float objectColorB = 0.3f;
-    private float gridExtent = 1.0f;
+    private final List<Mesh> meshes = new ArrayList<>();
+    private List<Point3D> pointCloud;
+    private int pointsVao = 0, pointsVbo = 0, pointCount = 0;
 
-    public Renderer() {
-        // Шейдер для точек
-        String modelVertexShader = "#version 410 core\n" +
-                "layout(location = 0) in vec3 aPos;\n" +
-                "uniform mat4 model;\n" +
-                "uniform mat4 view;\n" +
-                "uniform mat4 projection;\n" +
-                "uniform float pointSizeScale;\n" +
-                "void main() {\n" +
-                "    gl_Position = projection * view * model * vec4(aPos, 1.0);\n" +
-                "    vec4 viewPos = view * model * vec4(aPos, 1.0);\n" +
-                "    float distance = length(viewPos);\n" +
-                "    gl_PointSize = pointSizeScale / distance;\n" +
-                "    gl_PointSize = clamp(gl_PointSize, 5.0, 20.0);\n" +
-                "}\n";
+    private float yaw = 0, pitch = 0;
+    private float objectColorR = 0.3f, objectColorG = 0.3f, objectColorB = 0.3f;
 
-        String modelFragmentShader = "#version 410 core\n" +
-                "out vec4 FragColor;\n" +
-                "uniform vec3 objectColor;\n" +
-                "void main() {\n" +
-                "    vec2 coord = gl_PointCoord - vec2(0.5);\n" +
-                "    if (length(coord) > 0.5) discard;\n" +
-                "    FragColor = vec4(objectColor, 1.0);\n" +
-                "}\n";
+    // Центр модели и коэффициент нормализации
+    private Vector3f modelCenter = new Vector3f(0, 0, 0);
+    private float modelScale = 1.0f;
 
-        modelShader = new ShaderProgram(modelVertexShader, modelFragmentShader);
+    public Renderer(WindowManager window, Camera camera) {
+        this.window = window;
+        this.camera = camera;
+    }
 
-
-        // Шейдер для треугольников с Phong-освещением для обеих сторон
-        String triangleVertexShader = "#version 410 core\n" +
-                "layout(location = 0) in vec3 aPos;\n" +
-                "layout(location = 1) in vec3 aNormal;\n" +
-                "out vec3 FragPos;\n" +
-                "out vec3 Normal;\n" +
-                "uniform mat4 model;\n" +
-                "uniform mat4 view;\n" +
-                "uniform mat4 projection;\n" +
-                "void main() {\n" +
-                "    FragPos = vec3(model * vec4(aPos, 1.0));\n" +
-                "    Normal = mat3(transpose(inverse(model))) * aNormal;\n" +
-                "    gl_Position = projection * view * model * vec4(aPos, 1.0);\n" +
-                "}\n";
-
-        String triangleFragmentShader = """
-                #version 410 core
-                out vec4 FragColor;
-                in vec3 FragPos;
-                in vec3 Normal;
-                uniform vec3 lightPos;
-                uniform vec3 viewPos;
-                uniform vec3 lightColor;
-                uniform vec3 objectColor;
-                uniform vec3 selectedColor;
-                void main() {
-                    if (selectedColor != vec3(0.0)) {
-                        FragColor = vec4(selectedColor, 1.0);
-                        return;
-                    }
-                    vec3 norm = normalize(Normal);
-                    vec3 viewDir = normalize(viewPos - FragPos);
-                    vec3 baseColor = (dot(norm, viewDir) > 0.0) ? objectColor : vec3(0.5, 0.5, 0.5);
-                    vec3 lightNorm = (dot(norm, viewDir) > 0.0) ? norm : -norm;
-                    float ambientStrength = 0.1;
-                    vec3 ambient = ambientStrength * lightColor;
-                    vec3 lightDir = normalize(lightPos - FragPos);
-                    float diff = max(dot(lightNorm, lightDir), 0.0);
-                    vec3 diffuse = diff * lightColor;
-                    float specularStrength = 0.5;
-                    vec3 reflectDir = reflect(-lightDir, lightNorm);
-                    float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32);
-                    vec3 specular = specularStrength * spec * lightColor;
-                    vec3 result = (ambient + diffuse + specular) * baseColor;
-                    FragColor = vec4(result, 1.0);
-                }
-                """;
-
-        triangleShader = new ShaderProgram(triangleVertexShader, triangleFragmentShader);
-
-        String gridVertexShader = "#version 410 core\n" +
-                "layout(location = 0) in vec3 aPos;\n" +
-                "layout(location = 1) in vec3 aColor;\n" +
-                "out vec3 color;\n" +
-                "uniform mat4 model;\n" +
-                "uniform mat4 view;\n" +
-                "uniform mat4 projection;\n" +
-                "uniform float scale;\n" +
-                "void main() {\n" +
-                "    gl_Position = projection * view * model * vec4(aPos * scale, 1.0);\n" +
-                "    color = aColor;\n" +
-                "}\n";
-
-        String gridFragmentShader = "#version 410 core\n" +
-                "in vec3 color;\n" +
-                "out vec4 FragColor;\n" +
-                "void main() {\n" +
-                "    FragColor = vec4(color, 1.0);\n" +
-                "}\n";
-
-        gridShader = new ShaderProgram(gridVertexShader, gridFragmentShader);
-
-        setupGridAndAxes();
-
-        meshVaoId = GL30.glGenVertexArrays();
-        meshVboId = GL15.glGenBuffers();
-        GL30.glBindVertexArray(meshVaoId);
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, meshVboId);
-        GL20.glVertexAttribPointer(0, 3, GL11.GL_FLOAT, false, 0, 0);
-        GL20.glEnableVertexAttribArray(0);
-        GL30.glBindVertexArray(0);
+    /** Инициализация шейдеров, сетки и осей */
+    public void init() {
+        initShaders();
+        buildGridAndAxes();
         glDisable(GL_CULL_FACE);
-        setObjectColor(0.0f, 0.5f, 1.0f);
     }
 
-    public void setupPointRenderData(List<Point3D> points) {
-        if (points == null || points.isEmpty()) {
-            if (pointsVaoId != 0) { // Если буферы существуют, но точек нет, очищаем
-                GL30.glDeleteVertexArrays(pointsVaoId);
-                GL15.glDeleteBuffers(pointsVboId);
-                pointsVaoId = 0;
-                pointsVboId = 0;
-                currentPointsCount = 0;
-            }
-            return;
-        }
+    private void initShaders() {
+        // Шейдер для точек
+        String pV = "#version 410 core\n" +
+                "layout(location=0) in vec3 aPos;\n" +
+                "uniform mat4 model,view,projection; uniform float pointSizeScale;\n" +
+                "void main(){ vec4 pos=projection*view*model*vec4(aPos,1); gl_Position=pos; float d=length(view*model*vec4(aPos,1)); gl_PointSize=clamp(pointSizeScale/d,5.0,20.0);} ";
+        String pF = "#version 410 core\n" +
+                "out vec4 FragColor; uniform vec3 objectColor;\n" +
+                "void main(){ vec2 c=gl_PointCoord-vec2(0.5); if(length(c)>0.5) discard; FragColor=vec4(objectColor,1);} ";
+        modelShader = new ShaderProgram(pV, pF);
 
-        FloatBuffer verticesBuffer = null;
-        try {
-            int numFloats = points.size() * 3; // x, y, z
-            verticesBuffer = BufferUtils.createFloatBuffer(numFloats);
-            for (Point3D p : points) {
-                verticesBuffer.put(p.x).put(p.y).put(p.z);
-            }
-            verticesBuffer.flip();
+        // Шейдер для треугольников
+        String tV = "#version 410 core\n" +
+                "layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNormal;\n" +
+                "out vec3 FragPos, Normal; uniform mat4 model,view,projection;\n" +
+                "void main(){ FragPos=vec3(model*vec4(aPos,1)); Normal=mat3(transpose(inverse(model)))*aNormal; gl_Position=projection*view*model*vec4(aPos,1);} ";
+        String tF = "#version 410 core\n" +
+                "in vec3 FragPos, Normal; out vec4 FragColor;\n" +
+                "uniform vec3 lightPos,viewPos,lightColor,objectColor,selectedColor;\n" +
+                "void main(){ if(selectedColor!=vec3(0)){FragColor=vec4(selectedColor,1);return;} vec3 norm=normalize(Normal); vec3 viewDir=normalize(viewPos-FragPos); vec3 base=dot(norm,viewDir)>0?objectColor:vec3(0.5); vec3 ln=dot(norm,viewDir)>0?norm:-norm; vec3 ambient=0.1*lightColor; vec3 diff= max(dot(ln,normalize(lightPos-FragPos)),0.0)*lightColor; vec3 spec=pow(max(dot(viewDir,reflect(-normalize(lightPos-FragPos),ln)),0.0),32)*0.5*lightColor; FragColor=vec4((ambient+diff+spec)*base,1);} ";
+        triangleShader = new ShaderProgram(tV, tF);
 
-            if (pointsVaoId == 0) { // Если VAO еще не создан, создаем его
-                pointsVaoId = GL30.glGenVertexArrays();
-                pointsVboId = GL15.glGenBuffers();
-            }
-
-            GL30.glBindVertexArray(pointsVaoId);
-            GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, pointsVboId);
-
-            // Если новый размер больше текущего, пересоздаем буфер, иначе обновляем
-            if (numFloats > currentPointsCount * 3) {
-                GL15.glBufferData(GL15.GL_ARRAY_BUFFER, verticesBuffer, GL15.GL_STATIC_DRAW);
-            } else {
-                GL15.glBufferSubData(GL15.GL_ARRAY_BUFFER, 0, verticesBuffer);
-            }
-            currentPointsCount = points.size();
-
-            GL20.glVertexAttribPointer(0, 3, GL11.GL_FLOAT, false, 0, 0); // Только позиции
-            GL20.glEnableVertexAttribArray(0);
-
-            GL30.glBindVertexArray(0); // Отвязываем VAO
-        } finally {
-            if (verticesBuffer != null) {
-                MemoryUtil.memFree(verticesBuffer); // Освобождаем нативный буфер
-            }
-        }
+        // Шейдер для сетки и осей
+        String gV = "#version 410 core\n" +
+                "layout(location=0) in vec3 aPos; layout(location=1) in vec3 aColor; out vec3 Color; uniform mat4 model,view,projection; uniform float scale;\n" +
+                "void main(){ gl_Position=projection*view*model*vec4(aPos*scale,1); Color=aColor;} ";
+        String gF = "#version 410 core\n" +
+                "in vec3 Color; out vec4 FragColor; void main(){ FragColor=vec4(Color,1);} ";
+        gridShader = new ShaderProgram(gV, gF);
     }
 
-    public void initOrUpdatePointsBuffers(List<Point3D> points) {
-        if (points == null || points.isEmpty()) {
-            cleanupPointsBuffers();
-            return;
-        }
-
-        if (pointsVaoId == 0) {
-            pointsVaoId = GL30.glGenVertexArrays();
-            System.out.println("DEBUG: Generated pointsVaoId = " + pointsVaoId);
-            pointsVboId = GL15.glGenBuffers();
-            System.out.println("DEBUG: Generated pointsVboId = " + pointsVboId);
-            System.out.println("Generated pointsVaoId: " + pointsVaoId + ", pointsVboId: " + pointsVboId);
-        }
-
-        currentPointsCount = points.size();
-
-        float[] vertexData = new float[currentPointsCount * 3];
-        for (int i = 0; i < currentPointsCount; i++) {
-            Point3D point = points.get(i);
-            vertexData[i * 3] = point.x;
-            vertexData[i * 3 + 1] = point.y;
-            vertexData[i * 3 + 2] = point.z;
-        }
-
-        FloatBuffer vertexBuffer = MemoryUtil.memAllocFloat(vertexData.length);
-        vertexBuffer.put(vertexData).flip();
-
-        GL30.glBindVertexArray(pointsVaoId);
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, pointsVboId);
-        GL15.glBufferData(GL15.GL_ARRAY_BUFFER, vertexBuffer, GL15.GL_STATIC_DRAW);
-        GL20.glVertexAttribPointer(0, 3, GL11.GL_FLOAT, false, 3 * 4, 0);
-        GL20.glEnableVertexAttribArray(0);
-        GL30.glBindVertexArray(0);
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, 0);
-        MemoryUtil.memFree(vertexBuffer);
-
-        checkGLError("initOrUpdatePointsBuffers");
-    }
-
-    public void cleanupPointsBuffers() {
-        if (pointsVaoId != 0) {
-            GL30.glDeleteVertexArrays(pointsVaoId);
-            pointsVaoId = 0;
-        }
-        if (pointsVboId != 0) {
-            GL15.glDeleteBuffers(pointsVboId);
-            pointsVboId = 0;
-        }
-        currentPointsCount = 0;
-        checkGLError("cleanupPointsBuffers");
-    }
-
-    private void setupGridAndAxes() {
-        List<Float> gridVertices = new ArrayList<>();
-        List<Integer> gridIndices = new ArrayList<>();
-        int index = 0;
+    private void buildGridAndAxes() {
+        // сетка
+        List<Float> gv = new ArrayList<>();
+        List<Integer> gi = new ArrayList<>();
+        int idx = 0;
         for (int x = -50; x <= 50; x++) {
-            gridVertices.add((float) x); gridVertices.add(0.0f); gridVertices.add(-50.0f);
-            gridVertices.add(0.3f); gridVertices.add(0.3f); gridVertices.add(0.3f); // Тёмно-серый
-            gridVertices.add((float) x); gridVertices.add(0.0f); gridVertices.add(50.0f);
-            gridVertices.add(0.3f); gridVertices.add(0.3f); gridVertices.add(0.3f);
-            gridVertices.add((float) -50); gridVertices.add(0.0f); gridVertices.add((float) x);
-            gridVertices.add(0.3f); gridVertices.add(0.3f); gridVertices.add(0.3f);
-            gridVertices.add((float) 50); gridVertices.add(0.0f); gridVertices.add((float) x);
-            gridVertices.add(0.3f); gridVertices.add(0.3f); gridVertices.add(0.3f);
-            gridIndices.add(index++); gridIndices.add(index++);
-            gridIndices.add(index++); gridIndices.add(index++);
+            gv.add((float)x); gv.add(0f); gv.add(-50f); gv.add(0.3f); gv.add(0.3f); gv.add(0.3f);
+            gv.add((float)x); gv.add(0f); gv.add(50f);  gv.add(0.3f); gv.add(0.3f); gv.add(0.3f);
+            gv.add(-50f);      gv.add(0f); gv.add((float)x); gv.add(0.3f); gv.add(0.3f); gv.add(0.3f);
+            gv.add(50f);       gv.add(0f); gv.add((float)x); gv.add(0.3f); gv.add(0.3f); gv.add(0.3f);
+            gi.add(idx++); gi.add(idx++); gi.add(idx++); gi.add(idx++);
         }
-
-        float[] gridVerticesArray = new float[gridVertices.size()];
-        for (int i = 0; i < gridVertices.size(); i++) {
-            gridVerticesArray[i] = gridVertices.get(i);
-        }
-        int[] gridIndicesArray = new int[gridIndices.size()];
-        for (int i = 0; i < gridIndices.size(); i++) {
-            gridIndicesArray[i] = gridIndices.get(i);
-        }
-        gridMesh = new Mesh(gridVerticesArray, gridIndicesArray);
-
-        float[] axisVertices = {
-                -50.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
-                50.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
-                0.0f, -50.0f, 0.0f, 0.0f, 1.0f, 0.0f,
-                0.0f, 50.0f, 0.0f, 0.0f, 1.0f, 0.0f,
-                0.0f, 0.0f, -50.0f, 0.0f, 0.0f, 1.0f,
-                0.0f, 0.0f, 50.0f, 0.0f, 0.0f, 1.0f
+        float[] gva = new float[gv.size()]; for(int i=0;i<gv.size();i++) gva[i]=gv.get(i);
+        int[] gia = new int[gi.size()]; for(int i=0;i<gi.size();i++) gia[i]=gi.get(i);
+        gridMesh = new Mesh(gva, gia);
+        // оси
+        float[] ava = {
+                -50f,0f,0f, 1f,0f,0f, 50f,0f,0f, 1f,0f,0f,
+                0f,-50f,0f, 0f,1f,0f, 0f,50f,0f, 0f,1f,0f,
+                0f,0f,-50f, 0f,0f,1f, 0f,0f,50f, 0f,0f,1f
         };
-        int[] axisIndices = {0, 1, 2, 3, 4, 5};
-        axisMesh = new Mesh(axisVertices, axisIndices);
+        int[] aia = {0,1,2,3,4,5};
+        axisMesh = new Mesh(ava, aia);
     }
 
-    public void updateGridSize(float extent) {
-        gridExtent = extent * 10.0f;
-        List<Float> gridVertices = new ArrayList<>();
-        List<Integer> gridIndices = new ArrayList<>();
-        int index = 0;
-        float step = gridExtent / 50.0f; // Плотность линий
-        for (float x = -gridExtent; x <= gridExtent; x += step) {
-            gridVertices.add(x); gridVertices.add(0.0f); gridVertices.add(-gridExtent);
-            gridVertices.add(0.3f); gridVertices.add(0.3f); gridVertices.add(0.3f);
-            gridVertices.add(x); gridVertices.add(0.0f); gridVertices.add(gridExtent);
-            gridVertices.add(0.3f); gridVertices.add(0.3f); gridVertices.add(0.3f);
-            gridVertices.add(-gridExtent); gridVertices.add(0.0f); gridVertices.add(x);
-            gridVertices.add(0.3f); gridVertices.add(0.3f); gridVertices.add(0.3f);
-            gridVertices.add(gridExtent); gridVertices.add(0.0f); gridVertices.add(x);
-            gridVertices.add(0.3f); gridVertices.add(0.3f); gridVertices.add(0.3f);
-            gridIndices.add(index++); gridIndices.add(index++);
-            gridIndices.add(index++); gridIndices.add(index++);
-        }
-
-        float[] gridVerticesArray = new float[gridVertices.size()];
-        for (int i = 0; i < gridVertices.size(); i++) {
-            gridVerticesArray[i] = gridVertices.get(i);
-        }
-        int[] gridIndicesArray = new int[gridIndices.size()];
-        for (int i = 0; i < gridIndices.size(); i++) {
-            gridIndicesArray[i] = gridIndices.get(i);
-        }
-        if (gridMesh != null) {
-            gridMesh.cleanup();
-        }
-        gridMesh = new Mesh(gridVerticesArray, gridIndicesArray);
-
-        float[] axisVertices = {
-                -gridExtent, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
-                gridExtent, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
-                0.0f, -gridExtent, 0.0f, 0.0f, 1.0f, 0.0f,
-                0.0f, gridExtent, 0.0f, 0.0f, 1.0f, 0.0f,
-                0.0f, 0.0f, -gridExtent, 0.0f, 0.0f, 1.0f,
-                0.0f, 0.0f, gridExtent, 0.0f, 0.0f, 1.0f
-        };
-        int[] axisIndices = {0, 1, 2, 3, 4, 5};
-        if (axisMesh != null) {
-            axisMesh.cleanup();
-        }
-        axisMesh = new Mesh(axisVertices, axisIndices);
+    public void clearMeshes() {
+        for (Mesh m : meshes) m.cleanup();
+        meshes.clear();
     }
 
+    public void addMesh(Mesh mesh) {
+        meshes.add(mesh);
+    }
+
+    public void clearPointCloud() {
+        if (pointsVao != 0) { glDeleteVertexArrays(pointsVao); pointsVao = 0; }
+        if (pointsVbo != 0) { glDeleteBuffers(pointsVbo); pointsVbo = 0; }
+        pointCloud = null;
+    }
+
+    public void updatePointCloud(List<Point3D> points) {
+        this.pointCloud = points;
+        this.pointsVao = 0;
+    }
+
+    public void setOrientation(float yaw, float pitch) {
+        this.yaw = yaw;
+        this.pitch = pitch;
+    }
 
     public void setObjectColor(float r, float g, float b) {
-        objectColorR = r;
-        objectColorG = g;
-        objectColorB = b;
-        modelShader.use();
-        modelShader.setUniform3f("objectColor", r, g, b);
-        triangleShader.use();
-        triangleShader.setUniform3f("objectColor", r, g, b);
-        checkGLError("After setting object color");
+        this.objectColorR = r;
+        this.objectColorG = g;
+        this.objectColorB = b;
+        modelShader.use(); modelShader.setUniform3f("objectColor", r, g, b);
+        triangleShader.use(); triangleShader.setUniform3f("objectColor", r, g, b);
     }
 
-    public void render(WindowManager window,Camera camera, List<ModelLoader.Chunk> chunks, float modelYaw, float modelPitch) {
+    /** Устанавливает центр и масштаб модели перед рендерингом */
+    public void setModelTransform(Vector3f center, float scale) {
+        this.modelCenter.set(center);
+        this.modelScale = scale;
+    }
+
+    /** Основной метод рисования: сетка + оси + меши / точки */
+    public void renderScene() {
         glClearColor(0.8f, 0.8f, 0.8f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glEnable(GL_DEPTH_TEST);
-        checkGLError("After clear");
 
-        Matrix4f model = new Matrix4f().identity();
+        // Модельная матрица: центрирование, масштаб, затем вращение
+        Matrix4f modelMatrix = new Matrix4f()
+                .translate(-modelCenter.x, -modelCenter.y, -modelCenter.z)
+                .scale(modelScale)
+                .rotateY((float)Math.toRadians(yaw))
+                .rotateX((float)Math.toRadians(pitch));
         Matrix4f view = camera.getViewMatrix();
-        Matrix4f projection = camera.getProjectionMatrix((float) window.getWidth() / window.getHeight(), 0.1f, 1000.0f);
+        Matrix4f proj = camera.getProjectionMatrix(
+                (float)window.getWidth()/window.getHeight(), 0.1f, 1000f);
 
-        FloatBuffer modelBuffer = BufferUtils.createFloatBuffer(16);
-        FloatBuffer viewBuffer = BufferUtils.createFloatBuffer(16);
-        FloatBuffer projBuffer = BufferUtils.createFloatBuffer(16);
+        FloatBuffer mb = BufferUtils.createFloatBuffer(16);
+        FloatBuffer vb = BufferUtils.createFloatBuffer(16);
+        FloatBuffer pb = BufferUtils.createFloatBuffer(16);
+        modelMatrix.get(mb);
+        view.get(vb);
+        proj.get(pb);
 
-        // Рендеринг сетки и осей
+        // Рисуем сетку и оси в мировых координатах
         gridShader.use();
-        model.identity().get(modelBuffer);
-        view.get(viewBuffer);
-        projection.get(projBuffer);
-        gridShader.setUniformMatrix4fv("model", modelBuffer);
-        gridShader.setUniformMatrix4fv("view", viewBuffer);
-        gridShader.setUniformMatrix4fv("projection", projBuffer);
-        gridShader.setUniform1f("scale", gridExtent / 50.0f); // Масштабируем сетку
-        glLineWidth(1.0f);
+        gridShader.setUniformMatrix4fv("model", mb);
+        gridShader.setUniformMatrix4fv("view", vb);
+        gridShader.setUniformMatrix4fv("projection", pb);
+        gridShader.setUniform1f("scale", 1.0f);
+        glLineWidth(1f);
         glDepthFunc(GL_LEQUAL);
         gridMesh.render(GL_LINES);
-        glLineWidth(1.0f);
         axisMesh.render(GL_LINES);
-        glLineWidth(1.0f);
         glDepthFunc(GL_LESS);
-        checkGLError("After grid and axis draw");
 
-        if (chunks.isEmpty()) {
-            return;
-        }
-
-        triangleShader.use();
-        model.identity();
-        if (!chunks.isEmpty()) {
-            ModelLoader.AABB globalAABB = new ModelLoader().getGlobalAABB(chunks);
-            Vector3f center = globalAABB.center();
-            model.translate(center.x, center.y, center.z);
-            model.rotate((float) Math.toRadians(modelYaw), 0, 1, 0);
-            model.rotate((float) Math.toRadians(modelPitch), 1, 0, 0);
-            model.translate(-center.x, -center.y, -center.z);
-        }
-        model.get(modelBuffer);
-        view.get(viewBuffer);
-        projection.get(projBuffer);
-        triangleShader.setUniformMatrix4fv("model", modelBuffer);
-        triangleShader.setUniformMatrix4fv("view", viewBuffer);
-        triangleShader.setUniformMatrix4fv("projection", projBuffer);
-        triangleShader.setUniform3f("lightPos", 10.0f, 10.0f, 10.0f);
-        triangleShader.setUniform3f("lightColor", 1.0f, 1.0f, 1.0f);
-        triangleShader.setUniform3f("viewPos", camera.getPosition().x, camera.getPosition().y, camera.getPosition().z);
-        triangleShader.setUniform3f("objectColor", objectColorR, objectColorG, objectColorB);
-        triangleShader.setUniform3f("selectedColor", 0.0f, 0.0f, 0.0f);
-
-        checkGLError("After setting uniforms for triangles");
-
-        for (ModelLoader.Chunk chunk : chunks) {
-            if (chunk.mesh.getVao() != 0) {
-                chunk.mesh.render();
-            }
+        if (!meshes.isEmpty()) {
+            triangleShader.use();
+            triangleShader.setUniformMatrix4fv("model", mb);
+            triangleShader.setUniformMatrix4fv("view", vb);
+            triangleShader.setUniformMatrix4fv("projection", pb);
+            triangleShader.setUniform3f("lightPos", 10, 10, 10);
+            triangleShader.setUniform3f("lightColor", 1, 1, 1);
+            Vector3f camPos = camera.getPosition();
+            triangleShader.setUniform3f("viewPos", camPos.x, camPos.y, camPos.z);
+            triangleShader.setUniform3f("selectedColor", 0, 0, 0);
+            for (Mesh m : meshes) m.render();
+        } else if (pointCloud != null) {
+            modelShader.use();
+            modelShader.setUniformMatrix4fv("model", mb);
+            modelShader.setUniformMatrix4fv("view", vb);
+            modelShader.setUniformMatrix4fv("projection", pb);
+            modelShader.setUniform1f("pointSizeScale", 10.0f);
+            if (pointsVao == 0) initPointBuffers();
+            glEnable(GL32C.GL_PROGRAM_POINT_SIZE);
+            glBindVertexArray(pointsVao);
+            glDrawArrays(GL_POINTS, 0, pointCloud.size());
+            glBindVertexArray(0);
+            glDepthFunc(GL_LESS);
         }
     }
 
-    public void renderPoints(WindowManager window, Camera camera, List<Point3D> points, float yaw, float pitch) {
-        if (points == null || points.isEmpty()) return;
-
-        glClearColor(0.8f, 0.8f, 0.8f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        glEnable(GL_DEPTH_TEST);
-        glEnable(GL32C.GL_PROGRAM_POINT_SIZE);
-        checkGLError("After setup");
-
-        Vector3f center = new Vector3f();
-        float minX = Float.MAX_VALUE, maxX = -Float.MAX_VALUE;
-        float minY = Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
-        float minZ = Float.MAX_VALUE, maxZ = -Float.MAX_VALUE;
-        for (Point3D point : points) {
-            minX = Math.min(minX, point.x);
-            maxX = Math.max(maxX, point.x);
-            minY = Math.min(minY, point.y);
-            maxY = Math.max(maxY, point.y);
-            minZ = Math.min(minZ, point.z);
-            maxZ = Math.max(maxZ, point.z);
+    private void initPointBuffers() {
+        pointsVao = glGenVertexArrays();
+        pointsVbo = glGenBuffers();
+        glBindVertexArray(pointsVao);
+        glBindBuffer(GL_ARRAY_BUFFER, pointsVbo);
+        int count = pointCloud.size();
+        float[] data = new float[count*3];
+        for (int i = 0; i < count; i++) {
+            Point3D p = pointCloud.get(i);
+            data[i*3]   = (p.x - modelCenter.x) * modelScale;
+            data[i*3+1] = (p.y - modelCenter.y) * modelScale;
+            data[i*3+2] = (p.z - modelCenter.z) * modelScale;
         }
-        center.set((minX + maxX) * 0.5f, (minY + maxY) * 0.5f, (minZ + maxZ) * 0.5f);
-        float extent = Math.max(maxX - minX, Math.max(maxY - minY, maxZ - minZ)) * 0.5f;
-
-        updateGridSize(extent);
-
-        Matrix4f model = new Matrix4f().identity();
-        model.translate(center.x, center.y, center.z);
-        model.rotate((float) Math.toRadians(pitch), 1, 0, 0);
-        model.rotate((float) Math.toRadians(yaw), 0, 1, 0);
-        model.translate(-center.x, -center.y, -center.z);
-
-        Matrix4f view = camera.getViewMatrix();
-        Matrix4f projection = camera.getProjectionMatrix((float) window.getWidth() / window.getHeight(), 0.1f, 1000.0f);
-
-        float[] vertexData = new float[points.size() * 3];
-        for (int i = 0; i < points.size(); i++) {
-            Point3D point = points.get(i);
-            vertexData[i * 3] = point.x;
-            vertexData[i * 3 + 1] = point.y;
-            vertexData[i * 3 + 2] = point.z;
-        }
-
-        FloatBuffer vertexBuffer = MemoryUtil.memAllocFloat(vertexData.length);
-        vertexBuffer.put(vertexData).flip();
-        int vboPoints = GL15.glGenBuffers();
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, vboPoints);
-        GL15.glBufferData(GL15.GL_ARRAY_BUFFER, vertexBuffer, GL15.GL_STATIC_DRAW);
-        MemoryUtil.memFree(vertexBuffer);
-
-        int vaoPoints = GL30.glGenVertexArrays();
-        GL30.glBindVertexArray(vaoPoints);
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, vboPoints);
-        GL20.glVertexAttribPointer(0, 3, GL11.GL_FLOAT, false, 3 * 4, 0);
-        GL20.glEnableVertexAttribArray(0);
-        GL30.glBindVertexArray(0);
-
-        modelShader.use();
-        FloatBuffer modelBuffer = BufferUtils.createFloatBuffer(16);
-        FloatBuffer viewBuffer = BufferUtils.createFloatBuffer(16);
-        FloatBuffer projBuffer = BufferUtils.createFloatBuffer(16);
-        model.get(modelBuffer);
-        view.get(viewBuffer);
-        projection.get(projBuffer);
-        modelShader.setUniformMatrix4fv("model", modelBuffer);
-        modelShader.setUniformMatrix4fv("view", viewBuffer);
-        modelShader.setUniformMatrix4fv("projection", projBuffer);
-        modelShader.setUniform1f("pointSizeScale", 10.0f);
-        modelShader.setUniform3f("objectColor", objectColorR, objectColorG, objectColorB);
-
-        checkGLError("After setting uniforms");
-
-        GL30.glBindVertexArray(vaoPoints);
-        GL11.glDrawArrays(GL11.GL_POINTS, 0, points.size());
-        GL30.glBindVertexArray(0);
-
-        GL15.glDeleteBuffers(vboPoints);
-        GL30.glDeleteVertexArrays(vaoPoints);
-
-        gridShader.use();
-        model.identity().get(modelBuffer);
-        gridShader.setUniformMatrix4fv("model", modelBuffer);
-        gridShader.setUniformMatrix4fv("view", viewBuffer);
-        gridShader.setUniformMatrix4fv("projection", projBuffer);
-        gridShader.setUniform1f("scale", gridExtent / 50.0f);
-        glLineWidth(1.0f);
-        glDepthFunc(GL_LEQUAL);
-        gridMesh.render(GL_LINES);
-        glLineWidth(2.0f);
-        axisMesh.render(GL_LINES);
-        glLineWidth(1.0f);
-        glDepthFunc(GL_LESS);
-        checkGLError("After grid and axis draw");
-    }
-
-    private void checkGLError(String stage) {
-        int error = glGetError();
-        if (error != GL_NO_ERROR) {
-            System.err.println("OpenGL Error at " + stage + ": " + error);
-        }
+        glBufferData(GL_ARRAY_BUFFER, data, GL_STATIC_DRAW);
+        glVertexAttribPointer(0,3,GL_FLOAT,false,3*4,0);
+        glEnableVertexAttribArray(0);
+        glBindVertexArray(0);
     }
 
     public void cleanup() {
         modelShader.cleanup();
         triangleShader.cleanup();
         gridShader.cleanup();
-        if (gridMesh != null) gridMesh.cleanup();
-        if (axisMesh != null) axisMesh.cleanup();
-        GL15.glDeleteBuffers(meshVboId);
-        GL30.glDeleteVertexArrays(meshVaoId);
-        cleanupPointsBuffers();
+        gridMesh.cleanup();
+        axisMesh.cleanup();
+        clearMeshes();
+        clearPointCloud();
     }
 }
+
